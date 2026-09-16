@@ -1322,47 +1322,46 @@ class YtmAccountSelector(unittest.TestCase):
         for n, v in self._saved.items():
             setattr(ytm, n, v)
 
-    # Two Google logins: the first has a personal channel (currently active) + one brand account;
-    # the second is a bare login. Mirrors account/accounts_list's grouping.
-    _SWITCHER = {
-        "contents": [
-            {"accountItemSectionRenderer": {"contents": [
-                {"accountItemRenderer": {
-                    "accountName": {"runs": [{"text": "Personal Me"}]},
-                    "accountPhoto": {"thumbnails": [{"url": "http://p0.jpg"}]},
-                    "isSelected": True,
-                    "serviceEndpoint": {"selectActiveIdentityEndpoint": {"supportedTokens": [
-                        {"pageIdToken": {"pageId": ""}},
-                        {"datasyncIdToken": {"datasyncId": "ds0"}}]}}}},
-                {"accountItemRenderer": {
-                    "accountName": {"simpleText": "Brand A"},
-                    "channelHandle": {"simpleText": "@branda"},
-                    "serviceEndpoint": {"selectActiveIdentityEndpoint": {"supportedTokens": [
-                        {"pageIdToken": {"pageId": "UCbrandA"}},
-                        {"datasyncIdToken": {"datasyncId": "dsA"}}]}}}}]}},
-            {"accountItemSectionRenderer": {"contents": [
-                {"accountItemRenderer": {
-                    "accountName": {"runs": [{"text": "Second Login"}]},
-                    "serviceEndpoint": {"selectActiveIdentityEndpoint": {"supportedTokens": [
-                        {"datasyncIdToken": {"datasyncId": "ds1"}}]}}}}]}}]}
+    @staticmethod
+    def _switcher_for(authuser):
+        # account/accounts_list returns only the channel(s) for the probed authuser. Login 0 has a
+        # personal channel (active) + a brand account; login 1 is a bare account; 2+ = logged out.
+        if authuser == 0:
+            return {"contents": [{"accountItemSectionRenderer": {"contents": [
+                {"accountItem": {"accountName": {"simpleText": "Personal Me"},
+                                 "channelHandle": {"simpleText": "@me"}, "isSelected": True,
+                                 "serviceEndpoint": {"selectActiveIdentityEndpoint": {
+                                     "supportedTokens": [
+                                         {"accountStateToken": {"obfuscatedGaiaId": "gaia0"}}]}}}},
+                {"accountItem": {"accountName": {"simpleText": "Brand A"},
+                                 "channelHandle": {"simpleText": "@branda"},
+                                 "serviceEndpoint": {"selectActiveIdentityEndpoint": {
+                                     "supportedTokens": [
+                                         {"pageIdToken": {"pageId": "UCbrandA"}},
+                                         {"accountStateToken": {"obfuscatedGaiaId": "gaia0b"}}]}}}}]}}]}
+        if authuser == 1:
+            return {"contents": [{"accountItemSectionRenderer": {"contents": [
+                {"accountItem": {"accountName": {"simpleText": "Second Login"},
+                                 "serviceEndpoint": {"selectActiveIdentityEndpoint": {
+                                     "supportedTokens": [
+                                         {"accountStateToken": {"obfuscatedGaiaId": "gaia1"}}]}}}}]}}]}
+        return {"responseContext": {"mainAppWebResponseContext": {"loggedOut": True}}}
 
-    def test_list_accounts_parses_logins_and_brand_channels(self):
+    def test_list_accounts_probes_logins_and_brand_channels(self):
         import ytm
         ytm._auth_mode = lambda: "cookie"
-        ytm._innertube = lambda ep, body, **k: dict(self._SWITCHER)
+        ytm._innertube = lambda ep, body, **k: self._switcher_for(k.get("authuser", 0))
         ytm._load_cookies = lambda: {"authuser": "0", "page_id": ""}   # default identity
         res = ytm.list_accounts()
         self.assertTrue(res["ok"])
-        accts = res["accounts"]
-        self.assertEqual(len(accts), 3)
-        # Section 0 -> authuser 0 (personal, then brand); section 1 -> authuser 1.
-        self.assertEqual((accts[0]["authuser"], accts[0]["page_id"], accts[0]["name"]),
-                         ("0", "", "Personal Me"))
-        self.assertTrue(accts[0]["selected"])                 # isSelected AND matches default
-        self.assertEqual((accts[1]["authuser"], accts[1]["page_id"]), ("0", "UCbrandA"))
-        self.assertEqual(accts[1]["handle"], "@branda")
-        self.assertFalse(accts[1]["selected"])
-        self.assertEqual(accts[2]["authuser"], "1")
+        a = res["accounts"]
+        self.assertEqual(len(a), 3)          # probed authuser 0 (2) + 1 (1), then 2 = logged out
+        self.assertEqual((a[0]["authuser"], a[0]["page_id"], a[0]["name"]), ("0", "", "Personal Me"))
+        self.assertTrue(a[0]["selected"])                     # isSelected AND matches default
+        self.assertEqual((a[1]["authuser"], a[1]["page_id"]), ("0", "UCbrandA"))
+        self.assertEqual(a[1]["handle"], "@branda")
+        self.assertFalse(a[1]["selected"])
+        self.assertEqual((a[2]["authuser"], a[2]["name"]), ("1", "Second Login"))
 
     def test_list_accounts_requires_sign_in(self):
         import ytm
@@ -1370,6 +1369,39 @@ class YtmAccountSelector(unittest.TestCase):
         res = ytm.list_accounts()
         self.assertFalse(res["ok"])
         self.assertEqual(res["accounts"], [])
+
+    def test_list_accounts_logged_out(self):
+        import ytm
+        ytm._auth_mode = lambda: "cookie"
+        ytm._innertube = lambda ep, body, **k: {
+            "responseContext": {"mainAppWebResponseContext": {"loggedOut": True}}}
+        res = ytm.list_accounts()
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["accounts"], [])
+
+    def test_selected_follows_stored_choice_not_browser(self):
+        # The browser's active channel (isSelected) must NOT mark an account selected — only OUR
+        # stored choice does. Here the personal channel is browser-active but we've chosen the brand.
+        import ytm
+        ytm._auth_mode = lambda: "cookie"
+
+        def sw(authuser):
+            if authuser == 0:
+                return {"contents": [{"accountItemSectionRenderer": {"contents": [
+                    {"accountItem": {"accountName": {"simpleText": "Personal"}, "isSelected": True,
+                        "serviceEndpoint": {"selectActiveIdentityEndpoint": {"supportedTokens": [
+                            {"accountStateToken": {"obfuscatedGaiaId": "g0"}}]}}}},
+                    {"accountItem": {"accountName": {"simpleText": "Brand"},
+                        "serviceEndpoint": {"selectActiveIdentityEndpoint": {"supportedTokens": [
+                            {"pageIdToken": {"pageId": "UCb"}}]}}}}]}}]}
+            return {"responseContext": {"mainAppWebResponseContext": {"loggedOut": True}}}
+
+        ytm._innertube = lambda ep, body, **k: sw(k.get("authuser", 0))
+        ytm._load_cookies = lambda: {"authuser": "0", "page_id": "UCb"}   # chose the brand channel
+        res = ytm.list_accounts()
+        sel = {x["name"]: x["selected"] for x in res["accounts"]}
+        self.assertFalse(sel["Personal"])   # browser-active, but not our choice
+        self.assertTrue(sel["Brand"])       # our stored choice
 
     def test_select_persists_identity_and_clears_home_cache(self):
         import ytm, os, tempfile

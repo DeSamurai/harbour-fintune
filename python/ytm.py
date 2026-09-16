@@ -274,10 +274,11 @@ def _context(auth=False):
     return ctx
 
 
-def _innertube(endpoint, body, use_auth=True, timeout=30):
+def _innertube(endpoint, body, use_auth=True, timeout=30, authuser=None, page_id=None):
     """POST an InnerTube endpoint. When `use_auth`, authenticates with the imported browser
     cookies (SAPISIDHASH) if present, else an OAuth Bearer token if present; otherwise makes an
-    anonymous (public-key) request."""
+    anonymous (public-key) request. authuser/page_id override the stored selection (used to PROBE
+    each signed-in login in list_accounts)."""
     _force_ipv4()
     payload = {"context": _context()}
     payload.update(body or {})
@@ -303,9 +304,11 @@ def _innertube(endpoint, body, use_auth=True, timeout=30):
         # of the browser's active profile (the "picks just one account / my playlists don't show"
         # bug for multi-login and brand-account users).
         ident = _selected_identity()
-        headers["X-Goog-AuthUser"] = ident["authuser"]
-        if ident["page_id"]:
-            headers["X-Goog-PageId"] = ident["page_id"]
+        au = ident["authuser"] if authuser is None else str(authuser)
+        pid = ident["page_id"] if page_id is None else (page_id or "")
+        headers["X-Goog-AuthUser"] = au
+        if pid:
+            headers["X-Goog-PageId"] = pid
         # Read the visitor id from cache only — never block a browse/search on the homepage
         # fetch. If it's cold, warm it in the background for next time (get_home pre-warms it, so
         # personalized home still carries it). Authed calls are fine without it — the account
@@ -876,99 +879,151 @@ def select_account(authuser="0", page_id="", datasync_id="", name=""):
     return {"ok": True, "name": name or ""}
 
 
-def _account_items(node, out):
-    """Collect every accountItemRenderer under a node (defensive: YouTube reshuffles the tree)."""
+def _iter_find(node, key):
+    """Yield every dict stored under `key` anywhere in the tree (YouTube reshuffles containers)."""
     if isinstance(node, dict):
-        if isinstance(node.get("accountItemRenderer"), dict):
-            out.append(node["accountItemRenderer"])
-        for v in node.values():
-            _account_items(v, out)
+        v = node.get(key)
+        if isinstance(v, dict):
+            yield v
+        for vv in node.values():
+            yield from _iter_find(vv, key)
     elif isinstance(node, list):
-        for v in node:
-            _account_items(v, out)
+        for vv in node:
+            yield from _iter_find(vv, key)
 
 
-def _account_sections(node, out):
-    """Collect accountItemSectionRenderer nodes, in tree order. Each is one signed-in Google login
-    (its personal channel + any brand accounts), so the section index maps to X-Goog-AuthUser."""
+def _skeleton(node, depth=0, maxdepth=8):
+    """A values-free view of a JSON node — nested keys with leaf TYPES, no actual values. Safe to
+    paste from a debug log without redacting names/ids, while still revealing the structure."""
+    if depth > maxdepth:
+        return "…"
     if isinstance(node, dict):
-        if isinstance(node.get("accountItemSectionRenderer"), dict):
-            out.append(node["accountItemSectionRenderer"])
-        for v in node.values():
-            _account_sections(v, out)
-    elif isinstance(node, list):
-        for v in node:
-            _account_sections(v, out)
+        return {k: _skeleton(v, depth + 1, maxdepth) for k, v in node.items()}
+    if isinstance(node, list):
+        return [_skeleton(node[0], depth + 1, maxdepth)] if node else []
+    return type(node).__name__
+
+
+def _dump_shape(label, data):
+    """Log an InnerTube response's shape so an unexpected tree can be diagnosed from device logs:
+    top-level keys, every distinct *Renderer / account-ish key anywhere, and a raw head. DEBUG only."""
+    if not _DEBUG:
+        return
+    try:
+        top = list(data.keys()) if isinstance(data, dict) else type(data).__name__
+        keys = set()
+
+        def _walk(n):
+            if isinstance(n, dict):
+                for k in n:
+                    if k.endswith("Renderer") or "ccount" in k or "Item" in k or "ontinuation" in k:
+                        keys.add(k)
+                for v in n.values():
+                    _walk(v)
+            elif isinstance(n, list):
+                for v in n:
+                    _walk(v)
+
+        _walk(data)
+        _log("%s top-keys: %s" % (label, top))
+        _log("%s renderer-keys: %s" % (label, sorted(keys)))
+        _log("%s raw-head: %s" % (label, json.dumps(data)[:2000]))
+    except Exception as ex:
+        _log("%s dump failed: %s" % (label, ex))
 
 
 def _parse_account_item(item, authuser, sel):
-    """One accountItemRenderer -> our identity dict, or None if it carries nothing usable."""
-    runs = _nav(item, ["accountName", "runs"]) or []
-    name = "".join(r.get("text", "") for r in runs) or _nav(item, ["accountName", "simpleText"], "") or ""
+    """One accountItem -> our identity dict, or None if it carries nothing usable. The switcher keys
+    entries "accountItem" (older layouts: "accountItemRenderer"); tokens live under
+    serviceEndpoint.selectActiveIdentityEndpoint.supportedTokens — scanned defensively either way."""
+    name = _runs_text(item.get("accountName")) or _nav(item, ["accountName", "simpleText"], "") or ""
     handle = (_nav(item, ["channelHandle", "simpleText"], "")
-              or "".join(r.get("text", "") for r in (_nav(item, ["channelHandle", "runs"]) or [])))
+              or _runs_text(item.get("channelHandle"))
+              or _nav(item, ["accountByline", "simpleText"], "")
+              or _runs_text(item.get("accountByline")))
     thumbs = _nav(item, ["accountPhoto", "thumbnails"]) or []
     thumb = thumbs[-1].get("url", "") if thumbs and isinstance(thumbs[-1], dict) else ""
-    ep = item.get("serviceEndpoint") or {}
-    page_id, datasync = "", ""
-    for tok in _nav(ep, ["selectActiveIdentityEndpoint", "supportedTokens"], []) or []:
-        page_id = page_id or _nav(tok, ["pageIdToken", "pageId"], "")
-        datasync = datasync or _nav(tok, ["datasyncIdToken", "datasyncId"], "")
+    page_id, datasync, gaia = "", "", ""
+    for tok in _iter_find(item, "pageIdToken"):
+        page_id = page_id or tok.get("pageId", "")
+    for tok in _iter_find(item, "datasyncIdToken"):
+        datasync = datasync or tok.get("datasyncId", "")
+    for tok in _iter_find(item, "accountStateToken"):
+        gaia = gaia or tok.get("obfuscatedGaiaId", "")
     if not (name or page_id):
         return None
-    selected = bool(item.get("isSelected")) or (
-        str(authuser) == sel["authuser"] and (page_id or "") == sel["page_id"])
+    # Selection is driven solely by OUR stored identity (select_account), NOT the browser's active
+    # channel (item.isSelected) — otherwise the browser-active channel and our chosen one both light
+    # up. With nothing stored, sel defaults to authuser 0 / no page id, i.e. the default channel.
+    selected = str(authuser) == sel["authuser"] and (page_id or "") == sel["page_id"]
     return {"name": name or "Channel", "handle": handle or "", "thumb": thumb or "",
             "authuser": str(authuser), "page_id": page_id or "", "datasync_id": datasync or "",
-            "selected": selected}
+            "gaia": gaia or "", "selected": selected}
+
+
+def _account_item_dicts(node):
+    """The account entries in a switcher response — keyed "accountItem" (older: "accountItemRenderer")."""
+    out = []
+    for k in ("accountItem", "accountItemRenderer"):
+        out.extend(_iter_find(node, k))
+    return out
 
 
 def list_accounts():
-    """Enumerate the Google logins + channels (incl. brand accounts) in the imported session, for
-    the account selector. Requires a cookie session. Returns
+    """Signed-in Google logins + channels (incl. brand accounts) for the account picker:
     {ok, accounts:[{name, handle, thumb, authuser, page_id, datasync_id, selected}], error?}.
 
-    Source: the InnerTube account/accounts_list endpoint (the web account switcher). Its tree is
-    grouped into sections — one per signed-in Google login — and each section lists that login's
-    channels (personal first, then brand accounts). Section index -> X-Goog-AuthUser; each channel's
-    pageId -> X-Goog-PageId. Parsed defensively; a structural miss returns ok=False, not an
-    exception (run with YOUFISH_DEBUG=1 to dump the raw shape if a real multi-account tree differs)."""
+    account/accounts_list returns only the ACTIVE account(s) for the authuser it's called with — so we
+    PROBE X-Goog-AuthUser=0,1,2,… (each yields that login's channel(s), incl. brand channels), stop at
+    the first logged-out/empty index, and dedupe. That probe IS the switch mechanism, so anything we
+    can list here we can select. Heavily logged (YOUFISH_DEBUG=1)."""
     if _auth_mode() != "cookie":
         return {"ok": False, "accounts": [], "error": "Sign in first (Import from browser)."}
-    try:
-        data = _innertube("account/accounts_list", {})
-    except Exception as ex:
-        return {"ok": False, "accounts": [], "error": str(ex)}
     sel = _selected_identity()
-    accounts = []
-    sections = []
-    _account_sections(data, sections)
-    if sections:
-        for authuser, sec in enumerate(sections):
-            items = []
-            _account_items(sec, items)
-            for it in items:
-                a = _parse_account_item(it, authuser, sel)
-                if a:
-                    accounts.append(a)
-    else:
-        items = []                          # no section grouping — treat all as login 0
-        _account_items(data, items)
+    uniq, seen = [], set()
+    first_data = None
+    for n in range(0, 8):
+        try:
+            data = _innertube("account/accounts_list", {}, authuser=n, page_id="")
+        except Exception as ex:
+            _log("accounts_list authuser=%d failed: %s" % (n, ex))
+            if n == 0 and not uniq:      # first-probe failure is transient/network, not signed-out
+                return {"ok": False, "accounts": [],
+                        "error": "Couldn't reach YouTube to list accounts. Check your connection "
+                                 "and try again."}
+            break
+        if first_data is None:
+            first_data = data
+        logged_out = bool(_nav(data, ["responseContext", "mainAppWebResponseContext", "loggedOut"], False))
+        items = _account_item_dicts(data)
+        _log("accounts_list authuser=%d: loggedOut=%s items=%d" % (n, logged_out, len(items)))
+        if logged_out or not items:
+            break                                  # contiguous indices — nothing past here
+        added_here = 0
         for it in items:
-            a = _parse_account_item(it, 0, sel)
-            if a:
-                accounts.append(a)
-    # De-dup on (authuser, page_id) — the switcher can repeat the active identity in a header.
-    seen, uniq = set(), []
-    for a in accounts:
-        key = (a["authuser"], a["page_id"])
-        if key in seen:
-            continue
-        seen.add(key)
-        uniq.append(a)
+            a = _parse_account_item(it, n, sel)
+            if not a:
+                continue
+            key = (a["gaia"] or a["datasync_id"] or a["name"], a["page_id"])
+            if key in seen:
+                continue                           # authuser didn't switch (same account) → dedupe
+            seen.add(key)
+            uniq.append(a)
+            added_here += 1
+        if added_here == 0:
+            break                                  # only repeats of accounts we already have
+    _log("list_accounts: %d identities" % len(uniq))
     if not uniq:
-        _log("list_accounts: no accountItemRenderer found (structure changed?)")
-        return {"ok": False, "accounts": [], "error": "Couldn't read the account list."}
+        if _DEBUG and first_data is not None:
+            _dump_shape("accounts_list", first_data)
+        return {"ok": False, "accounts": [],
+                "error": "No accounts found — the imported session looks signed out. Open "
+                         "music.youtube.com in the Sailfish Browser, make sure you're signed in, "
+                         "then Re-import."}
+    if _DEBUG:
+        items0 = _account_item_dicts(first_data)
+        if items0:
+            _log("list_accounts: accountItem skeleton: %s" % json.dumps(_skeleton(items0[0])))
     return {"ok": True, "accounts": uniq}
 
 

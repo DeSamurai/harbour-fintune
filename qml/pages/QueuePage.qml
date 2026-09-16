@@ -54,6 +54,7 @@ Page {
                 fillMode: Image.PreserveAspectCrop
                 clip: true
                 asynchronous: true
+                sourceSize: Qt.size(width, height)   // #9: decode to the display box, not full res
                 source: modelData.thumb || ""
                 Rectangle {
                     anchors.fill: parent

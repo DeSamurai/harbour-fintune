@@ -33,6 +33,7 @@ Page {
         clip: true
         asynchronous: true
         visible: false                       // source for the blur only
+        sourceSize: Qt.size(parent.width, parent.height)   // #9: cap the blur source's decode
         source: app.artUrl(app.npThumb, 600)
     }
     FastBlur {
@@ -270,6 +271,7 @@ Page {
                         asynchronous: true
                         // Big, crisp cover for the player (list thumbs are tiny); falls back to
                         // the small one while the large version loads.
+                        sourceSize: Qt.size(parent.width, parent.height)   // #9: decode to the cover box, not full res
                         source: app.artUrl(app.npThumb, 600)
                         Image {
                             anchors.fill: parent
@@ -277,6 +279,7 @@ Page {
                             fillMode: Image.PreserveAspectCrop
                             clip: true
                             asynchronous: true
+                            sourceSize: Qt.size(parent.width, parent.height)   // #9: cap the placeholder decode
                             source: app.npThumb        // instant low-res placeholder underneath
                             visible: art.status !== Image.Ready
                         }

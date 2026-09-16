@@ -52,6 +52,7 @@ DISTFILES += \
     qml/pages/PlaylistPickerPage.qml \
     qml/pages/HistoryPage.qml \
     qml/pages/SettingsPage.qml \
+    qml/pages/AccountsPage.qml \
     qml/cover/CoverPage.qml \
     python/youfish.py \
     python/ytm.py \

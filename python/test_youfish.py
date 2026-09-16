@@ -1306,6 +1306,100 @@ class YtmIdentity(unittest.TestCase):
         self.assertIsNone(ver)   # the sanity check drops a value that isn't a 1.YYYYMMDD.xx.xx
 
 
+class YtmAccountSelector(unittest.TestCase):
+    """Account/channel selection (ytm.py): enumerate logins + brand-account channels from the
+    InnerTube account switcher, persist a choice, and apply it as X-Goog-AuthUser + X-Goog-PageId.
+    Fixes the multi-account bug where every call was pinned to login 0's default channel."""
+
+    def setUp(self):
+        import ytm
+        self._saved = {n: getattr(ytm, n) for n in
+                       ("_innertube", "_auth_mode", "_load_cookies", "_save_cookies",
+                        "_home_cache_path")}
+
+    def tearDown(self):
+        import ytm
+        for n, v in self._saved.items():
+            setattr(ytm, n, v)
+
+    # Two Google logins: the first has a personal channel (currently active) + one brand account;
+    # the second is a bare login. Mirrors account/accounts_list's grouping.
+    _SWITCHER = {
+        "contents": [
+            {"accountItemSectionRenderer": {"contents": [
+                {"accountItemRenderer": {
+                    "accountName": {"runs": [{"text": "Personal Me"}]},
+                    "accountPhoto": {"thumbnails": [{"url": "http://p0.jpg"}]},
+                    "isSelected": True,
+                    "serviceEndpoint": {"selectActiveIdentityEndpoint": {"supportedTokens": [
+                        {"pageIdToken": {"pageId": ""}},
+                        {"datasyncIdToken": {"datasyncId": "ds0"}}]}}}},
+                {"accountItemRenderer": {
+                    "accountName": {"simpleText": "Brand A"},
+                    "channelHandle": {"simpleText": "@branda"},
+                    "serviceEndpoint": {"selectActiveIdentityEndpoint": {"supportedTokens": [
+                        {"pageIdToken": {"pageId": "UCbrandA"}},
+                        {"datasyncIdToken": {"datasyncId": "dsA"}}]}}}}]}},
+            {"accountItemSectionRenderer": {"contents": [
+                {"accountItemRenderer": {
+                    "accountName": {"runs": [{"text": "Second Login"}]},
+                    "serviceEndpoint": {"selectActiveIdentityEndpoint": {"supportedTokens": [
+                        {"datasyncIdToken": {"datasyncId": "ds1"}}]}}}}]}}]}
+
+    def test_list_accounts_parses_logins_and_brand_channels(self):
+        import ytm
+        ytm._auth_mode = lambda: "cookie"
+        ytm._innertube = lambda ep, body, **k: dict(self._SWITCHER)
+        ytm._load_cookies = lambda: {"authuser": "0", "page_id": ""}   # default identity
+        res = ytm.list_accounts()
+        self.assertTrue(res["ok"])
+        accts = res["accounts"]
+        self.assertEqual(len(accts), 3)
+        # Section 0 -> authuser 0 (personal, then brand); section 1 -> authuser 1.
+        self.assertEqual((accts[0]["authuser"], accts[0]["page_id"], accts[0]["name"]),
+                         ("0", "", "Personal Me"))
+        self.assertTrue(accts[0]["selected"])                 # isSelected AND matches default
+        self.assertEqual((accts[1]["authuser"], accts[1]["page_id"]), ("0", "UCbrandA"))
+        self.assertEqual(accts[1]["handle"], "@branda")
+        self.assertFalse(accts[1]["selected"])
+        self.assertEqual(accts[2]["authuser"], "1")
+
+    def test_list_accounts_requires_sign_in(self):
+        import ytm
+        ytm._auth_mode = lambda: "none"
+        res = ytm.list_accounts()
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["accounts"], [])
+
+    def test_select_persists_identity_and_clears_home_cache(self):
+        import ytm, os, tempfile
+        store = {"sapisid": "abc"}
+        ytm._load_cookies = lambda: dict(store)
+        ytm._save_cookies = lambda c: (store.clear(), store.update(c))
+        tf = tempfile.NamedTemporaryFile(prefix="home_cache.", suffix=".json", delete=False)
+        tf.write(b'{"shelves":[]}'); tf.close()
+        ytm._home_cache_path = lambda: tf.name
+        try:
+            res = ytm.select_account("1", "UCxyz", "ds1", "My Brand")
+            self.assertTrue(res["ok"])
+            self.assertFalse(os.path.exists(tf.name))          # personalized home dropped
+            self.assertEqual(store["authuser"], "1")
+            self.assertEqual(store["page_id"], "UCxyz")
+            self.assertEqual(ytm.selected_account(),
+                             {"authuser": "1", "page_id": "UCxyz", "name": "My Brand"})
+        finally:
+            if os.path.exists(tf.name):
+                os.remove(tf.name)
+
+    def test_select_requires_sign_in(self):
+        import ytm
+        store = {}                                             # no sapisid → not signed in
+        ytm._load_cookies = lambda: dict(store)
+        ytm._save_cookies = lambda c: (store.clear(), store.update(c))
+        res = ytm.select_account("1", "UCxyz", "", "x")
+        self.assertFalse(res["ok"])
+
+
 class PotEnsureBudget(unittest.TestCase):
     """_ensure_pot_server(wait=) must give up quickly when another thread owns an in-flight
     boot (holds the lock) — the resolve hot path passes a short grace instead of joining a

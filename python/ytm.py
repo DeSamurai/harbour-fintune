@@ -295,7 +295,17 @@ def _innertube(endpoint, body, use_auth=True, timeout=30):
         ck = _load_cookies()
         headers["Cookie"] = ck.get("cookie", "")
         headers["Authorization"] = _sapisidhash(ck.get("sapisid", ""), _YTM_ORIGIN)
-        headers["X-Goog-AuthUser"] = "0"
+        # Which identity to act as. X-Goog-AuthUser picks among multiple signed-in Google LOGINS
+        # (by browser slot index); X-Goog-PageId picks a brand-account CHANNEL within one login.
+        # Both default to the primary channel of login 0 (empty page id) unless the user has chosen
+        # otherwise in the account selector — see select_account(). This used to be hardcoded to
+        # AuthUser 0 with no PageId, which pinned every call to login 0's default channel regardless
+        # of the browser's active profile (the "picks just one account / my playlists don't show"
+        # bug for multi-login and brand-account users).
+        ident = _selected_identity()
+        headers["X-Goog-AuthUser"] = ident["authuser"]
+        if ident["page_id"]:
+            headers["X-Goog-PageId"] = ident["page_id"]
         # Read the visitor id from cache only — never block a browse/search on the homepage
         # fetch. If it's cold, warm it in the background for next time (get_home pre-warms it, so
         # personalized home still carries it). Authed calls are fine without it — the account
@@ -822,6 +832,144 @@ def _auth_mode():
     if _load_tokens().get("refresh_token"):
         return "oauth"
     return "none"
+
+
+# --------------------------------------------------------------------------- #
+# Account / channel selection. One imported browser session can carry several signed-in Google
+# LOGINS and, within a login, several CHANNELS (brand accounts). The user picks one in the account
+# selector; the choice is stored in the cookie file and applied to every authed InnerTube call as
+# X-Goog-AuthUser (the login) + X-Goog-PageId (the channel). Defaults to login 0's primary channel.
+# --------------------------------------------------------------------------- #
+
+def _selected_identity():
+    """The chosen identity (or the default) as {authuser, page_id, datasync_id, name}."""
+    c = _load_cookies()
+    return {"authuser": str(c.get("authuser") or "0"),
+            "page_id": c.get("page_id") or "",
+            "datasync_id": c.get("datasync_id") or "",
+            "name": c.get("selected_name") or ""}
+
+
+def selected_account():
+    """The currently-selected identity, for the account selector UI: {authuser, page_id, name}."""
+    i = _selected_identity()
+    return {"authuser": i["authuser"], "page_id": i["page_id"], "name": i["name"]}
+
+
+def select_account(authuser="0", page_id="", datasync_id="", name=""):
+    """Persist the identity to act as and apply it to future InnerTube calls. Clears the
+    personalized home cache so the switch shows up immediately. Returns {ok, name, error?}."""
+    with _cookies_lock:
+        c = _load_cookies()
+        if not c.get("sapisid"):
+            return {"ok": False, "error": "Sign in first (Import from browser)."}
+        c["authuser"] = str(authuser or "0")
+        c["page_id"] = page_id or ""
+        c["datasync_id"] = datasync_id or ""
+        c["selected_name"] = name or ""
+        _save_cookies(c)
+    try:
+        os.remove(_home_cache_path())   # personalized → drop so it re-fetches for the new identity
+    except Exception:
+        pass
+    _log("selected account authuser=%s page_id=%s name=%r" % (authuser, page_id, name))
+    return {"ok": True, "name": name or ""}
+
+
+def _account_items(node, out):
+    """Collect every accountItemRenderer under a node (defensive: YouTube reshuffles the tree)."""
+    if isinstance(node, dict):
+        if isinstance(node.get("accountItemRenderer"), dict):
+            out.append(node["accountItemRenderer"])
+        for v in node.values():
+            _account_items(v, out)
+    elif isinstance(node, list):
+        for v in node:
+            _account_items(v, out)
+
+
+def _account_sections(node, out):
+    """Collect accountItemSectionRenderer nodes, in tree order. Each is one signed-in Google login
+    (its personal channel + any brand accounts), so the section index maps to X-Goog-AuthUser."""
+    if isinstance(node, dict):
+        if isinstance(node.get("accountItemSectionRenderer"), dict):
+            out.append(node["accountItemSectionRenderer"])
+        for v in node.values():
+            _account_sections(v, out)
+    elif isinstance(node, list):
+        for v in node:
+            _account_sections(v, out)
+
+
+def _parse_account_item(item, authuser, sel):
+    """One accountItemRenderer -> our identity dict, or None if it carries nothing usable."""
+    runs = _nav(item, ["accountName", "runs"]) or []
+    name = "".join(r.get("text", "") for r in runs) or _nav(item, ["accountName", "simpleText"], "") or ""
+    handle = (_nav(item, ["channelHandle", "simpleText"], "")
+              or "".join(r.get("text", "") for r in (_nav(item, ["channelHandle", "runs"]) or [])))
+    thumbs = _nav(item, ["accountPhoto", "thumbnails"]) or []
+    thumb = thumbs[-1].get("url", "") if thumbs and isinstance(thumbs[-1], dict) else ""
+    ep = item.get("serviceEndpoint") or {}
+    page_id, datasync = "", ""
+    for tok in _nav(ep, ["selectActiveIdentityEndpoint", "supportedTokens"], []) or []:
+        page_id = page_id or _nav(tok, ["pageIdToken", "pageId"], "")
+        datasync = datasync or _nav(tok, ["datasyncIdToken", "datasyncId"], "")
+    if not (name or page_id):
+        return None
+    selected = bool(item.get("isSelected")) or (
+        str(authuser) == sel["authuser"] and (page_id or "") == sel["page_id"])
+    return {"name": name or "Channel", "handle": handle or "", "thumb": thumb or "",
+            "authuser": str(authuser), "page_id": page_id or "", "datasync_id": datasync or "",
+            "selected": selected}
+
+
+def list_accounts():
+    """Enumerate the Google logins + channels (incl. brand accounts) in the imported session, for
+    the account selector. Requires a cookie session. Returns
+    {ok, accounts:[{name, handle, thumb, authuser, page_id, datasync_id, selected}], error?}.
+
+    Source: the InnerTube account/accounts_list endpoint (the web account switcher). Its tree is
+    grouped into sections — one per signed-in Google login — and each section lists that login's
+    channels (personal first, then brand accounts). Section index -> X-Goog-AuthUser; each channel's
+    pageId -> X-Goog-PageId. Parsed defensively; a structural miss returns ok=False, not an
+    exception (run with YOUFISH_DEBUG=1 to dump the raw shape if a real multi-account tree differs)."""
+    if _auth_mode() != "cookie":
+        return {"ok": False, "accounts": [], "error": "Sign in first (Import from browser)."}
+    try:
+        data = _innertube("account/accounts_list", {})
+    except Exception as ex:
+        return {"ok": False, "accounts": [], "error": str(ex)}
+    sel = _selected_identity()
+    accounts = []
+    sections = []
+    _account_sections(data, sections)
+    if sections:
+        for authuser, sec in enumerate(sections):
+            items = []
+            _account_items(sec, items)
+            for it in items:
+                a = _parse_account_item(it, authuser, sel)
+                if a:
+                    accounts.append(a)
+    else:
+        items = []                          # no section grouping — treat all as login 0
+        _account_items(data, items)
+        for it in items:
+            a = _parse_account_item(it, 0, sel)
+            if a:
+                accounts.append(a)
+    # De-dup on (authuser, page_id) — the switcher can repeat the active identity in a header.
+    seen, uniq = set(), []
+    for a in accounts:
+        key = (a["authuser"], a["page_id"])
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(a)
+    if not uniq:
+        _log("list_accounts: no accountItemRenderer found (structure changed?)")
+        return {"ok": False, "accounts": [], "error": "Couldn't read the account list."}
+    return {"ok": True, "accounts": uniq}
 
 
 # --------------------------------------------------------------------------- #

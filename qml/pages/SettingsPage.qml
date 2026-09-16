@@ -11,6 +11,9 @@ Page {
     property bool hideDock: true   // hide the now-playing dock / resume bar over Settings
     property string dlError: ""   // last download-folder error (e.g. not writable), shown inline
 
+    // Populate the selected-channel label from the persisted choice (the "Channel" ValueButton).
+    Component.onCompleted: if (app.backend.ytmLoggedIn) app.backend.ytmSelectedAccount()
+
     SilicaFlickable {
         anchors.fill: parent
         contentHeight: col.height + Theme.paddingLarge
@@ -83,6 +86,17 @@ Page {
                     })
                 }
             }
+            // Pick which login / channel (incl. brand accounts) to use — only meaningful once signed
+            // in. Defaults to login 0's primary channel; the picker is where multi-account users fix
+            // "it uses the wrong channel / my playlists don't show".
+            ValueButton {
+                visible: app.backend.ytmLoggedIn
+                label: "Channel"
+                value: app.backend.ytmSelectedName || app.backend.ytmAccount || "Default"
+                description: "Choose which account or channel (incl. brand accounts) to use."
+                onClicked: pageStack.push(Qt.resolvedUrl("AccountsPage.qml"))
+            }
+
             Button {
                 anchors.horizontalCenter: parent.horizontalCenter
                 visible: app.backend.ytmLoggedIn

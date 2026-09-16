@@ -71,6 +71,10 @@ Item {
     // it, "expired" = credentials stored but rejected (needs re-import). Drives the visual indicator.
     property string ytmSessionState: ""
     property string ytmAccount: ""       // signed-in account name (from the last successful verify)
+    // Account/channel selector: the logins + channels (incl. brand accounts) in the imported
+    // session, and the display name of the one currently in use.
+    property var ytmAccounts: []         // [{name,handle,thumb,authuser,page_id,datasync_id,selected}]
+    property string ytmSelectedName: ""  // display name of the selected identity ("" = default)
 
     signal resolved(var info)
     signal resolveError(string message)
@@ -244,6 +248,40 @@ Item {
             backend.ytmLoginMsg = ""
             backend.ytmSessionState = ""
             backend.ytmAccount = ""
+            backend.ytmAccounts = []
+            backend.ytmSelectedName = ""
+        })
+    }
+
+    // --- Account / channel selector (multiple Google logins + brand accounts) ---
+    // Enumerate the identities in the imported session → backend.ytmAccounts. Callback gets the
+    // raw {ok, accounts, error?} so a page can show an error.
+    function ytmListAccounts(callback) {
+        py.call("ytm.list_accounts", [], function(res) {
+            backend.ytmAccounts = (res && res.ok && res.accounts) ? res.accounts : []
+            if (callback) callback(res || {})
+        })
+    }
+    // Switch the active identity, then re-verify so the account name + personalized home/library
+    // refresh for the new channel. `a` is an entry from ytmAccounts.
+    function ytmSelectAccount(a, callback) {
+        if (!a) { if (callback) callback({}); return }
+        py.call("ytm.select_account",
+                [a.authuser || "0", a.page_id || "", a.datasync_id || "", a.name || ""],
+                function(res) {
+            if (res && res.ok) {
+                backend.ytmSelectedName = res.name || ""
+                backend.ytmAccount = res.name || backend.ytmAccount
+                backend.verifySession(function() {})   // confirm + refresh for the new identity
+            }
+            if (callback) callback(res || {})
+        })
+    }
+    // The currently-selected identity's display name → backend.ytmSelectedName (for the Settings row).
+    function ytmSelectedAccount(callback) {
+        py.call("ytm.selected_account", [], function(res) {
+            if (res) backend.ytmSelectedName = res.name || ""
+            if (callback) callback(res || {})
         })
     }
 
@@ -264,6 +302,8 @@ Item {
                 backend.ytmLoggedIn = true
                 backend.ytmSessionState = "live"
                 backend.ytmAccount = res.account || ""
+                backend.ytmAccounts = []          // fresh session → re-enumerate on demand
+                backend.ytmSelectedName = ""      // and back to the default identity
                 backend.ytmLoginMsg = res.account
                     ? ("Signed in as " + res.account + ".")
                     : ("Imported " + (res.count || 0) + " cookies.")

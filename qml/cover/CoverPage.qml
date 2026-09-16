@@ -23,6 +23,7 @@ CoverBackground {
         clip: true
         asynchronous: true
         visible: false                       // source for the blur only
+        sourceSize: Qt.size(parent.width, parent.height)   // #9: cap the blur source's decode
         source: cover.active ? cover.thumb : ""
     }
     FastBlur {

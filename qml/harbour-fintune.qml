@@ -625,6 +625,7 @@ ApplicationWindow {
             fillMode: Image.PreserveAspectCrop
             clip: true
             asynchronous: true
+            sourceSize: Qt.size(width, height)   // #9: decode to the display box, not full res
             source: app.npThumb
             Rectangle {               // placeholder tint when there's no art yet
                 anchors.fill: parent

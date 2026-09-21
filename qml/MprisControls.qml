@@ -7,6 +7,10 @@ import Amber.Mpris 1.0
 MprisPlayer {
     id: mpris
     property var np: null
+    property string title: ""
+    property string artist: ""
+    property string artUrl: ""
+    property int duration: 0
 
     serviceName: "fintune"
     identity: "FinTune"
@@ -31,12 +35,12 @@ MprisPlayer {
     onNextRequested: if (np) np.nextRequested()
     onPreviousRequested: if (np) np.prevRequested()
 
-    //Metadata changes
-    onPlaybackStatusChanged: setMetaData()
+    //MetaData changes
+    onTitleChanged: mpris.metaData.title = mpris.title
+    onArtistChanged: mpris.metaData.contributingArtist = mpris.artist
+    onArtUrlChanged: mpris.metaData.artUrl = mpris.artUrl
+    onDurationChanged: mpris.metaData.duration = mpris.duration
 
-    function setMetaData() {
-        if (np && np.title !== metaData.title) metaData.title = np.title
-        if (np && np.channel !== metaData.contributingArtist) metaData.contributingArtist = np.channel
-        if (np && np.thumb !== metaData.artUrl) metaData.artUrl = np.thumb
-    }
+    //
+    onPositionRequested: mpris.position = np.position
 }
